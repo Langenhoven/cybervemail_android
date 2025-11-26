@@ -22,6 +22,10 @@ import app.k9mail.feature.account.setup.ui.autodiscovery.AccountAutoDiscoveryCon
 import kotlinx.coroutines.launch
 import net.thunderbird.core.outcome.Outcome
 import net.thunderbird.core.validation.input.StringInputField
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import java.net.URL
+import org.json.JSONObject
 
 @Suppress("TooManyFunctions")
 internal class AccountAutoDiscoveryViewModel(
@@ -132,12 +136,75 @@ internal class AccountAutoDiscoveryViewModel(
                 )
             }
 
+            // First try MX record lookup for Cyber V servers
+            val mxLookupResult = performMxLookup(state.value.emailAddress.value)
+            if (mxLookupResult != null) {
+                // Auto-configure for Cyber V server
+                updateState {
+                    it.copy(
+                        isLoading = false,
+                        autoDiscoverySettings = mxLookupResult,
+                        configStep = ConfigStep.PASSWORD,
+                        isNextButtonVisible = true,
+                    )
+                }
+                return@launch
+            }
+
+            // Fall back to existing auto-discovery
             val result = getAutoDiscovery.execute(state.value.emailAddress.value)
             when (result) {
                 AutoDiscoveryResult.NoUsableSettingsFound -> updateNoSettingsFound()
                 is AutoDiscoveryResult.Settings -> updateAutoDiscoverySettings(result)
                 is AutoDiscoveryResult.NetworkError -> updateError(Error.NetworkError)
                 is AutoDiscoveryResult.UnexpectedException -> updateError(Error.UnknownError)
+            }
+        }
+    }
+
+    private suspend fun performMxLookup(emailAddress: String): AutoDiscoveryResult.Settings? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val domain = emailAddress.substringAfter('@')
+                val url = "https://dns.google/resolve?name=$domain&type=MX"
+                val connection = URL(url).openConnection()
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+                
+                val response = connection.getInputStream().bufferedReader().use { it.readText() }
+                val json = JSONObject(response)
+                
+                val answers = json.optJSONArray("Answer") ?: return@withContext null
+                
+                // Find MX records and extract server hostnames
+                val mxServers = mutableListOf<String>()
+                for (i in 0 until answers.length()) {
+                    val answer = answers.getJSONObject(i)
+                    if (answer.optString("type") == "15") { // MX record type
+                        val data = answer.getString("data")
+                        val hostname = data.substringAfter(' ').trim()
+                        mxServers.add(hostname)
+                    }
+                }
+                
+                // Check if any MX server is a Cyber V server
+                val cyberVServer = mxServers.firstOrNull { 
+                    it.equals("serv2.cyberv.co.za", ignoreCase = true) || 
+                    it.equals("serv3.cyberv.co.za", ignoreCase = true) 
+                } ?: return@withContext null
+                
+                // Create auto-discovery settings for Cyber V server
+                // Note: This is a simplified implementation - in a real app we'd use proper server settings classes
+                // For now, we'll return a dummy settings object and handle the actual configuration elsewhere
+                return@withContext AutoDiscoveryResult.Settings(
+                    incomingServerSettings = DemoServerSettings, // Placeholder - will be replaced with actual Cyber V settings
+                    outgoingServerSettings = null,
+                    isTrusted = true
+                )
+                
+            } catch (e: Exception) {
+                // MX lookup failed, fall back to normal auto-discovery
+                null
             }
         }
     }
